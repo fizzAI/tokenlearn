@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 from typing import Iterable
 
@@ -9,10 +10,18 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 _SAVE_INTERVAL = 10
+_MAX_MEANS = 1100000
 
 
-def featurize(texts: Iterable[str], model: SentenceTransformer, output_dir: str) -> list[tuple[str, np.ndarray]]:
-    """Featurize text using a sentence transformer."""
+def featurize(texts: Iterable[str], model: SentenceTransformer, output_dir: str) -> None:
+    """
+    Featurize text using a sentence transformer.
+
+    :param texts: Iterable of texts to featurize.
+    :param model: SentenceTransformer model to use.
+    :param output_dir: Directory to save the featurized texts.
+    :raises ValueError: If the model does not have a fixed dimension.
+    """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     model_dim = model.get_sentence_embedding_dimension()
@@ -22,13 +31,14 @@ def featurize(texts: Iterable[str], model: SentenceTransformer, output_dir: str)
     txts = []
     means = []
     seen = set()
+    total_means = 0
 
     for index, batch in enumerate(tqdm(batched(texts, 32))):
         i = index // _SAVE_INTERVAL
         if (out_path / f"featurized_{i}.json").exists():
             continue
         # Consume the generator
-        list_batch = [x for x in [x.strip() for x in batch] if x]
+        list_batch = [x["text"].strip() for x in batch if x.get("text")]
 
         # Already truncated to model max_length
         tokenized_ids = model.tokenize(list_batch)["input_ids"]
@@ -45,6 +55,13 @@ def featurize(texts: Iterable[str], model: SentenceTransformer, output_dir: str)
             mean = np.mean(token_embedding[1:-1], axis=0)
             txts.append(text)
             means.append(mean)
+            total_means += 1
+
+            if total_means >= _MAX_MEANS:
+                # Save the final batch and stop
+                r = Reach(means, txts)
+                r.save(out_path / f"featurized_{(index // _SAVE_INTERVAL)}.json")
+                return
 
         if index > 0 and (index + 1) % _SAVE_INTERVAL == 0:
             r = Reach(means, txts)
@@ -57,12 +74,16 @@ def featurize(texts: Iterable[str], model: SentenceTransformer, output_dir: str)
             r = Reach(means, txts)
             r.save(out_path / f"featurized_{(index // _SAVE_INTERVAL)}.json")
 
-    return means
-
 
 if __name__ == "__main__":
-    model = SentenceTransformer("baai/bge-base-en-v1.5")
-
-    # use name="sample-10BT" to use the 10BT sample
-    fw = load_dataset("HuggingFaceFW/fineweb", name="CC-MAIN-2024-10", split="train", streaming=True)
-    means = featurize(fw, model, "data/fineweb")
+    parser = argparse.ArgumentParser(description="Train a Model2Vec using tokenlearn.")
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="baai/bge-base-en-v1.5",
+        help="The model name for distillation (e.g., 'baai/bge-base-en-v1.5').",
+    )
+    args = parser.parse_args()
+    model = SentenceTransformer(args.model_name)
+    dataset = load_dataset("allenai/c4", name="en", split="train", streaming=True)
+    featurize(dataset, model, "data/c4_bgebase")
