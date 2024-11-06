@@ -10,7 +10,7 @@ from model2vec.distill import distill
 from sklearn.decomposition import PCA
 
 from tokenlearn.train import TextDataset, train_supervised
-from tokenlearn.utils import collect_means_and_texts, count_tokens
+from tokenlearn.utils import calculate_token_probabilities, collect_means_and_texts
 
 logging.basicConfig(level=logging.INFO)
 
@@ -45,7 +45,7 @@ def weight_model(model: StaticModel, text: list[str], pca_dims: int, alpha: floa
     :return: The weighted model.
     """
     logging.info("Applying reweighting and PCA to the model.")
-    count_vector = count_tokens(model.tokenizer, text)
+    probas = calculate_token_probabilities(model.tokenizer, text)
 
     w = model.embedding
     w = np.nan_to_num(w)
@@ -55,7 +55,7 @@ def weight_model(model: StaticModel, text: list[str], pca_dims: int, alpha: floa
     w = p.fit_transform(w)
 
     # Apply SIF weighting
-    f = alpha / (alpha + count_vector)
+    f = alpha / (alpha + probas)
     w *= f[:, None]
     model.embedding = w
     model.normalize = True

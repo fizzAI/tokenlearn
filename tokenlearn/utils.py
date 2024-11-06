@@ -34,7 +34,7 @@ def collect_means_and_texts(paths: list[Path]) -> tuple[list[str], np.ndarray]:
     return txts, np.concatenate(v)
 
 
-def count_tokens(tokenizer: Tokenizer, txt: list[str]) -> np.ndarray:
+def calculate_token_probabilities(tokenizer: Tokenizer, txt: list[str]) -> np.ndarray:
     """Count tokens in a set of texts."""
     vocab_size = tokenizer.get_vocab_size()
     counts: Counter[int] = Counter()
