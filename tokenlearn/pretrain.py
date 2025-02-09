@@ -13,23 +13,6 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-# Try to import wandb for logging
-try:
-    import wandb
-
-    _WANDB_INSTALLED = True
-except ImportError:
-    _WANDB_INSTALLED = False
-
-
-def init_wandb(project_name: str, config: dict | None = None) -> None:
-    """Initialize Weights & Biases for tracking experiments if wandb is installed."""
-    if _WANDB_INSTALLED:
-        wandb.init(project=project_name, config=config)
-        logger.info(f"W&B initialized with project: {project_name}")
-    else:
-        logger.info("Skipping W&B initialization since wandb is not installed.")
-
 
 class StaticModelFineTuner(nn.Module):
     def __init__(self, vectors: torch.Tensor, out_dim: int, pad_id: int) -> None:
@@ -45,20 +28,23 @@ class StaticModelFineTuner(nn.Module):
         self.embeddings = nn.Embedding.from_pretrained(vectors.clone(), freeze=False, padding_idx=pad_id)
         self.n_out = out_dim
         self.out_layer = nn.Linear(vectors.shape[1], self.n_out)
-        weights = torch.ones(len(vectors))
-        weights[pad_id] = 0
+        weights = torch.zeros(len(vectors))
+        weights[pad_id] = -10_000
         self.w = nn.Parameter(weights)
 
-    def sub_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def sub_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass through the mean."""
-        w = self.w[x]
-        zeros = (x != self.pad_id).float()
-        length = zeros.sum(1)
-        embedded = self.embeddings(x)
+        w = self.w[input_ids]
+        w = torch.sigmoid(w)
+        zeros = (input_ids != self.pad_id).float()
+        w = w * zeros
+        # Add a small epsilon to avoid division by zero
+        length = zeros.sum(1) + 1e-16
+        embedded = self.embeddings(input_ids)
         # Simulate actual mean
         # Zero out the padding
-        embedded = embedded * zeros[:, :, None]
-        embedded = (embedded * w[:, :, None]).sum(1) / w.sum(1)[:, None]
+        embedded = torch.bmm(w[:, None, :], embedded).squeeze(1)
+        # embedded = embedded.sum(1)
         embedded = embedded / length[:, None]
 
         return embedded
@@ -118,64 +104,25 @@ class TextDataset(Dataset):
 
 def train_supervised(  # noqa: C901
     train_dataset: TextDataset,
+    validation_dataset: TextDataset,
     model: StaticModel,
-    max_epochs: int = 50,
-    min_epochs: int = 1,
     patience: int | None = 5,
-    patience_min_delta: float = 0.001,
     device: str = "cpu",
     batch_size: int = 256,
-    project_name: str | None = None,
-    config: dict | None = None,
-    lr_scheduler_patience: int = 3,
-    lr_scheduler_min_delta: float = 0.03,
-    cosine_weight: float = 1.0,
-    mse_weight: float = 1.0,
-    lr_model: float = 0.003,
-    lr_linear: float = 0.01,
+    lr: float = 1e-3,
 ) -> StaticModel:
     """
     Train a tokenlearn model.
 
     :param train_dataset: The training dataset.
+    :param validation_dataset: The validation dataset.
     :param model: The model to train.
-    :param max_epochs: The maximum number of epochs to train.
-    :param min_epochs: The minimum number of epochs to train.
     :param patience: The number of epochs to wait before early stopping.
-    :param patience_min_delta: The minimum delta for early stopping.
     :param device: The device to train on.
     :param batch_size: The batch size.
-    :param project_name: The name of the project for W&B.
-    :param config: The configuration for W&B.
-    :param lr_scheduler_patience: The patience for the learning rate scheduler.
-    :param lr_scheduler_min_delta: The minimum delta for the learning rate scheduler.
-    :param cosine_weight: The weight for the cosine loss.
-    :param mse_weight: The weight for the MSE loss.
-    :param lr_model: The learning rate for the model.
-    :param lr_linear: The learning rate for the linear layer.
+    :param lr: The learning rate.
     :return: The trained model.
     """
-    if config is None:
-        config = {
-            "batch_size": batch_size,
-            "max_epochs": max_epochs,
-            "min_epochs": min_epochs,
-            "patience": patience,
-            "lr_scheduler_patience": lr_scheduler_patience,
-            "lr_scheduler_min_delta": lr_scheduler_min_delta,
-            "cosine_weight": cosine_weight,
-            "mse_weight": mse_weight,
-            "lr_model": lr_model,
-            "lr_linear": lr_linear,
-        }
-
-    # Initialize W&B only if wandb is installed and project name is provided
-    if _WANDB_INSTALLED and project_name:
-        init_wandb(project_name=project_name, config=config)
-        wandb_initialized = True
-    else:
-        wandb_initialized = False
-
     train_dataloader = train_dataset.to_dataloader(shuffle=True, batch_size=batch_size)
 
     # Initialize the model
@@ -187,104 +134,85 @@ def train_supervised(  # noqa: C901
     trainable_model.to(device)
 
     # Separate parameters for model and linear layer
-    model_params = list(trainable_model.embeddings.parameters()) + [trainable_model.w]
-    linear_params = trainable_model.out_layer.parameters()
+    model_params = (
+        list(trainable_model.embeddings.parameters())
+        + [trainable_model.w]
+        + list(trainable_model.out_layer.parameters())
+    )
 
     # Create optimizer with separate parameter groups
-    optimizer = torch.optim.Adam([{"params": model_params, "lr": lr_model}, {"params": linear_params, "lr": lr_linear}])
-
-    criterion = nn.CosineSimilarity()
-
-    # Initialize the learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=lr_scheduler_patience,
-        verbose=True,
-        min_lr=1e-6,
-        threshold=lr_scheduler_min_delta,
-        threshold_mode="rel",
-    )
+    optimizer = torch.optim.Adam(params=model_params, lr=lr)
 
     lowest_loss = float("inf")
     param_dict = trainable_model.state_dict()
     curr_patience = patience
+    stop = False
+
+    criterion = nn.MSELoss()
 
     try:
-        for epoch in range(max_epochs):
+        for epoch in range(100_000):
             logger.info(f"Epoch {epoch}")
             trainable_model.train()
 
             # Track train loss separately
             train_losses = []
-            cosine_losses = []
-            mse_losses = []
             barred_train = tqdm(train_dataloader, desc=f"Epoch {epoch:03d} [Train]")
 
-            for x, y in barred_train:
+            for idx, (x, y) in enumerate(barred_train):
                 optimizer.zero_grad()
                 x = x.to(trainable_model.device)
                 y_hat, emb = trainable_model(x)
                 # Separate loss components
-                cosine_loss = 1 - criterion(y_hat, y.to(trainable_model.device)).mean()
-                mse_loss = (emb**2).mean()
+                dist_loss = criterion(y_hat, y.to(trainable_model.device)).mean()
+                mse_loss = emb.pow(2).mean()
+                train_loss = dist_loss + mse_loss
 
                 # Apply weights
-                total_loss = cosine_weight * cosine_loss + mse_weight * mse_loss
-                total_loss.backward()
+                train_loss.backward()
 
                 optimizer.step()
+                train_losses.append(train_loss.item())
 
-                train_losses.append(total_loss.item())
-                cosine_losses.append(cosine_loss.item())
-                mse_losses.append(mse_loss.item())
+                barred_train.set_description_str(f"Train Loss: {np.mean(train_losses[-10:]):.3f}")
 
-                barred_train.set_description_str(f"Train Loss: {np.mean(train_losses):.3f}")
+                trainable_model.eval()
+                if idx % 1000 == 0:
+                    with torch.no_grad():
+                        validation_losses = []
+                        barred_val = tqdm(
+                            validation_dataset.to_dataloader(shuffle=False, batch_size=batch_size), desc="Validation"
+                        )
+                        for x_val, y_val in barred_val:
+                            x_val = x_val.to(trainable_model.device)
+                            y_hat_val, emb = trainable_model(x_val)
+                            dist_loss = criterion(y_hat_val, y_val.to(trainable_model.device)).mean()
+                            mse_loss = emb.pow(2).mean()
+                            val_loss = dist_loss + mse_loss
+                            validation_losses.append(val_loss.item())
+                            barred_val.set_description_str(f"Validation Loss: {np.mean(validation_losses):.3f}")
 
-            # Calculate average losses
-            avg_train_loss = np.mean(train_losses)
-            avg_cosine_loss = np.mean(cosine_losses)
-            avg_mse_loss = np.mean(mse_losses)
+                        validation_loss = np.mean(validation_losses)
+                    # Early stopping logic based on validation loss
+                    if patience is not None and curr_patience is not None:
+                        if (lowest_loss - validation_loss) > 1e-4:
+                            param_dict = trainable_model.state_dict()  # Save best model state based on training loss
+                            curr_patience = patience
+                            lowest_loss = validation_loss
+                        else:
+                            curr_patience -= 1
+                            if curr_patience == 0:
+                                stop = True
+                                break
+                        logger.info(f"Patience level: {patience - curr_patience}")
+                        logger.info(f"Validation loss: {validation_loss}")
+                        logger.info(f"Lowest loss: {lowest_loss:.3f}")
 
-            # Step the scheduler with the current training loss
-            scheduler.step(avg_train_loss)
+                    trainable_model.train()
 
-            # Get current learning rates
-            current_lr_model = optimizer.param_groups[0]["lr"]
-            current_lr_linear = optimizer.param_groups[1]["lr"]
-
-            # Log training loss and learning rates to wandb
-            if wandb_initialized:
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        "train_loss": avg_train_loss,
-                        "cosine_loss": avg_cosine_loss,
-                        "mse_loss": avg_mse_loss,
-                        "learning_rate_model": current_lr_model,
-                        "learning_rate_linear": current_lr_linear,
-                    }
-                )
-
-            # Early stopping logic based on training loss
-            if patience is not None and curr_patience is not None and epoch >= min_epochs:
-                if (lowest_loss - avg_train_loss) > patience_min_delta:
-                    param_dict = trainable_model.state_dict()  # Save best model state based on training loss
-                    curr_patience = patience
-                    lowest_loss = avg_train_loss
-                else:
-                    curr_patience -= 1
-                    if curr_patience == 0:
-                        break
-                patience_str = "🌝" * curr_patience
-                logger.info(f"Patience level: {patience_str}")
-                logger.info(f"Lowest train loss: {lowest_loss:.3f}")
-
-            logger.info(f"Training loss: {avg_train_loss:.3f}")
-            logger.info(f"Cosine loss: {avg_cosine_loss:.3f}")
-            logger.info(f"MSE loss: {avg_mse_loss:.3f}")
-            trainable_model.train()
+            if stop:
+                logger.info("Early stopping")
+                break
 
     except KeyboardInterrupt:
         logger.info("Training interrupted")

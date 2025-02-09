@@ -30,6 +30,12 @@ def train_model(
     :param vocab_size: The vocabulary size to use (optional).
     :return: The trained model.
     """
+    train_txt, train_vec, val_txt, val_vec = (
+        train_txt[:-10_000],
+        train_vec[:-10_000],
+        train_txt[-10_000:],
+        train_vec[-10_000:],
+    )
     if vocab_size:
         # Create a vocabulary if a vocab size is specified
         vocab = create_vocab(texts=train_txt, vocab_size=vocab_size)
@@ -38,9 +44,10 @@ def train_model(
     else:
         model = distill(model_name=model_name)
     train_data = TextDataset(train_txt, torch.from_numpy(train_vec), model.tokenizer)
+    val_data = TextDataset(val_txt, torch.from_numpy(val_vec), model.tokenizer)
 
     # Train the model
-    model, _ = train_supervised(train_dataset=train_data, model=model, device=device)
+    model, _ = train_supervised(train_dataset=train_data, validation_dataset=val_data, model=model, device=device)
     return model
 
 
