@@ -35,19 +35,16 @@ def create_vocab(texts: list[str], vocab_size: int = 56_000) -> list[str]:
     return vocab
 
 
-def collect_means_and_texts(paths: list[Path]) -> tuple[list[str], np.ndarray]:
+def collect_means_and_texts(json_paths: list[Path]) -> tuple[list[str], np.ndarray]:
     """Collect means and texts from a list of paths."""
     txts = []
     vectors_list = []
-    for items_path in tqdm(paths, desc="Collecting means and texts"):
-        if not items_path.name.endswith(".json"):
-            continue
-        base_path = items_path.with_name(items_path.stem.replace("", ""))
-        vectors_path = items_path.with_name(base_path.name.replace(".json", "") + ".npy")
+    for text_path in tqdm(json_paths, desc="Collecting means and texts"):
+        base_path = text_path.parent
+        vectors_path = base_path / f"{text_path.stem}.npy"
         try:
-            with open(items_path, "r") as f:
-                data = json.load(f)
-            items = data.get("items", [])
+            with open(text_path, "r") as f:
+                items = json.load(f)
             vectors = np.load(vectors_path, allow_pickle=False)
         except (KeyError, FileNotFoundError, ValueError) as e:
             logger.info(f"Error loading data from {base_path}: {e}")

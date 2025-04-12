@@ -28,23 +28,22 @@ class StaticModelFineTuner(nn.Module):
         self.embeddings = nn.Embedding.from_pretrained(vectors.clone(), freeze=False, padding_idx=pad_id)
         self.n_out = out_dim
         self.out_layer = nn.Linear(vectors.shape[1], self.n_out)
-        weights = torch.zeros(len(vectors))
-        weights[pad_id] = -10_000
+        weights = torch.ones(len(vectors))
+        weights[pad_id] = 0
         self.w = nn.Parameter(weights)
 
     def sub_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass through the mean."""
         w = self.w[input_ids]
-        w = torch.sigmoid(w)
+        # w = torch.sigmoid(w)
         zeros = (input_ids != self.pad_id).float()
         w = w * zeros
         # Add a small epsilon to avoid division by zero
         length = zeros.sum(1) + 1e-16
         embedded = self.embeddings(input_ids)
-        # Simulate actual mean
         # Zero out the padding
         embedded = torch.bmm(w[:, None, :], embedded).squeeze(1)
-        # embedded = embedded.sum(1)
+        # Simulate actual mean
         embedded = embedded / length[:, None]
 
         return embedded
@@ -72,9 +71,9 @@ class TextDataset(Dataset):
         """
         if len(targets) != len(texts):
             raise ValueError("Number of labels does not match number of texts.")
-        self.texts = texts
+        self.texts = [x[:20_000] for x in texts]
         self.tokenized_texts: list[list[int]] = [
-            encoding.ids for encoding in tokenizer.encode_batch_fast(self.texts, add_special_tokens=False)
+            encoding.ids[:512] for encoding in tokenizer.encode_batch_fast(self.texts, add_special_tokens=False)
         ]
         self.targets = targets
         self.tokenizer = tokenizer
@@ -107,7 +106,7 @@ def train_supervised(  # noqa: C901
     validation_dataset: TextDataset,
     model: StaticModel,
     patience: int | None = 5,
-    device: str = "cpu",
+    device: str = "mps",
     batch_size: int = 256,
     lr: float = 1e-3,
 ) -> StaticModel:
@@ -141,7 +140,7 @@ def train_supervised(  # noqa: C901
     )
 
     # Create optimizer with separate parameter groups
-    optimizer = torch.optim.Adam(params=model_params, lr=lr)
+    optimizer = torch.optim.AdamW(params=model_params, lr=lr)
 
     lowest_loss = float("inf")
     param_dict = trainable_model.state_dict()
@@ -162,11 +161,9 @@ def train_supervised(  # noqa: C901
             for idx, (x, y) in enumerate(barred_train):
                 optimizer.zero_grad()
                 x = x.to(trainable_model.device)
-                y_hat, emb = trainable_model(x)
+                y_hat, _ = trainable_model(x)
                 # Separate loss components
-                dist_loss = criterion(y_hat, y.to(trainable_model.device)).mean()
-                mse_loss = emb.pow(2).mean()
-                train_loss = dist_loss + mse_loss
+                train_loss = criterion(y_hat, y.to(trainable_model.device)).mean()
 
                 # Apply weights
                 train_loss.backward()
@@ -176,8 +173,8 @@ def train_supervised(  # noqa: C901
 
                 barred_train.set_description_str(f"Train Loss: {np.mean(train_losses[-10:]):.3f}")
 
-                trainable_model.eval()
-                if idx % 1000 == 0:
+                if idx > 0 and idx % 1000 == 0:
+                    trainable_model.eval()
                     with torch.no_grad():
                         validation_losses = []
                         barred_val = tqdm(
@@ -185,10 +182,8 @@ def train_supervised(  # noqa: C901
                         )
                         for x_val, y_val in barred_val:
                             x_val = x_val.to(trainable_model.device)
-                            y_hat_val, emb = trainable_model(x_val)
-                            dist_loss = criterion(y_hat_val, y_val.to(trainable_model.device)).mean()
-                            mse_loss = emb.pow(2).mean()
-                            val_loss = dist_loss + mse_loss
+                            y_hat_val, _ = trainable_model(x_val)
+                            val_loss = criterion(y_hat_val, y_val.to(trainable_model.device)).mean()
                             validation_losses.append(val_loss.item())
                             barred_val.set_description_str(f"Validation Loss: {np.mean(validation_losses):.3f}")
 
@@ -205,7 +200,7 @@ def train_supervised(  # noqa: C901
                                 stop = True
                                 break
                         logger.info(f"Patience level: {patience - curr_patience}")
-                        logger.info(f"Validation loss: {validation_loss}")
+                        logger.info(f"Validation loss: {validation_loss:.3f}")
                         logger.info(f"Lowest loss: {lowest_loss:.3f}")
 
                     trainable_model.train()

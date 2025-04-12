@@ -2,7 +2,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Iterator
 
 import numpy as np
 from datasets import load_dataset
@@ -10,100 +10,77 @@ from more_itertools import batched
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-_SAVE_INTERVAL = 10
+_SAVE_EVERY = 32
+
+
 logger = logging.getLogger(__name__)
 
 
-def save_data(means: list[np.ndarray], txts: list[str], base_filepath: str) -> None:
-    """
-    Save the means and texts to separate files.
-
-    :param means: List of numpy arrays representing the mean embeddings.
-    :param txts: List of texts corresponding to the embeddings.
-    :param base_filepath: Base path for the output files.
-    """
-    vectors_filepath = base_filepath + "_vectors.npy"
-    items_filepath = base_filepath + "_items.json"
-
-    # Save the embeddings (vectors) to a .npy file
-    np.save(vectors_filepath, np.array(means))
-    # Save the texts to a JSON file
-    with open(items_filepath, "w") as f:
-        json.dump({"items": txts}, f)
-    logger.info(f"Saved {len(txts)} texts to {items_filepath} and vectors to {vectors_filepath}")
-
-
-def featurize(
-    texts: Iterable[str], model: SentenceTransformer, output_dir: str, max_means: int, batch_size: int
+def featurize(  # noqa: C901
+    dataset: Iterator[str | dict[str, str]],
+    model: SentenceTransformer,
+    output_dir: str,
+    max_means: int,
+    batch_size: int,
+    string_key: str,
 ) -> None:
-    """
-    Featurize text using a sentence transformer.
+    """Make a directory and dump all kinds of data in it."""
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    :param texts: Iterable of texts to featurize.
-    :param model: SentenceTransformer model to use.
-    :param output_dir: Directory to save the featurized texts.
-    :param max_means: Maximum number of mean embeddings to generate.
-    :param batch_size: Batch size to use during encoding. Larger batch sizes may improve speed but require more memory.
-    :raises ValueError: If the model does not have a fixed dimension.
-    """
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    model_dim = model.get_sentence_embedding_dimension()
-    if model_dim is None:
-        raise ValueError("Model does not have a fixed dimension")
+    # Ugly hack
+    largest_batch = max([int(x.stem.split("_")[1]) for x in list(output_dir_path.glob("*.json"))], default=0)
 
-    txts = []
-    means = []
-    seen = set()
-    total_means = 0
+    texts = []
+    embeddings = []
+    model_tokens = len(model.tokenizer.get_vocab())
+    dim = model.get_sentence_embedding_dimension()
+    if dim is None:
+        raise ValueError("Model has no sentence embedding dimension.")
 
-    for index, batch in enumerate(tqdm(batched(texts, batch_size))):
-        i = index // _SAVE_INTERVAL
-        base_filename = f"featurized_{i}"
-        list_batch = [x["text"].strip() for x in batch if x.get("text")]
-        if not list_batch:
-            continue  # Skip empty batches
+    # Resume the token embeddings and counts.
+    try:
+        token_embeddings = np.load(output_dir_path / "token_embeddings")
+        counts = np.load(output_dir_path / "counts")
+    except FileNotFoundError:
+        token_embeddings = np.zeros((model_tokens, dim))
+        counts = np.zeros(model_tokens)
 
-        # Encode the batch to get token embeddings
-        token_embeddings = model.encode(
-            list_batch,
-            output_value="token_embeddings",
-            convert_to_tensor=True,
-        )
+    for i, batch in tqdm(enumerate(batched(dataset, n=batch_size))):
+        if i * batch_size >= max_means:
+            logger.info(f"Reached maximum number of means: {max_means}")
+            break
+        if largest_batch and i <= largest_batch:
+            continue
+        batch = list(batch)
+        if string_key:
+            batch = [x[string_key] for x in batch]
 
-        # Tokenize the batch to get input IDs
-        tokenized_ids = model.tokenize(list_batch)["input_ids"]
+        if not all(isinstance(x, str) for x in batch):
+            raise ValueError(f"Detected non-string at batch: {i}")
 
-        for tokenized_id, token_embedding in zip(tokenized_ids, token_embeddings):
-            # Convert token IDs to tokens (excluding special tokens)
-            token_ids = tokenized_id[1:-1]
-            # Decode tokens to text
-            text = model.tokenizer.decode(token_ids)
-            if text in seen:
-                continue
-            seen.add(text)
-            # Get the corresponding token embeddings (excluding special tokens)
-            token_embeds = token_embedding[1:-1]
-            # Convert embeddings to NumPy arrays
-            token_embeds = token_embeds.detach().cpu().numpy()
-            # Compute the mean of the token embeddings
-            mean = np.mean(token_embeds, axis=0)
-            txts.append(text)
-            means.append(mean)
-            total_means += 1
-
-            if total_means >= max_means:
-                save_data(means, txts, str(out_path / base_filename))
-                return
-
-        if index > 0 and (index + 1) % _SAVE_INTERVAL == 0:
-            save_data(means, txts, str(out_path / base_filename))
-            txts = []
-            means = []
-            seen = set()
-    else:
-        if txts and means:
-            save_data(means, txts, str(out_path / base_filename))
+        batch_embeddings = model.encode(batch, output_value="token_embeddings")  # type: ignore  # Annoying
+        for text, embedding in zip(batch, batch_embeddings):
+            embedding = embedding.cpu().numpy()
+            texts.append(text)
+            # Encode twice, but avoid bs.
+            token_ids = model.tokenize([text])["input_ids"][0]
+            for token_id, emb in zip(token_ids, embedding, strict=True):
+                token_embeddings[token_id] += emb
+                counts[token_id] += 1
+            embeddings.append(embedding[1:-1].mean(axis=0))
+        if i and i % _SAVE_EVERY == 0:
+            json.dump(texts, open(output_dir_path / f"feature_{i}.json", "w"), indent=4)
+            np.save(output_dir_path / f"feature_{i}", embeddings)
+            np.save(output_dir_path / "token_embeddings", token_embeddings)
+            np.save(output_dir_path / "counts", counts)
+            texts = []
+            embeddings = []
+    if texts:
+        json.dump(texts, open(output_dir_path / f"feature_{i}.json", "w"), indent=4)
+        np.save(output_dir_path / f"feature_{i}", embeddings)
+        np.save(output_dir_path / "token_embeddings", token_embeddings)
+        np.save(output_dir_path / "counts", counts)
 
 
 def main() -> None:
@@ -118,7 +95,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="data/c4_bgebase",
+        default=None,
         help="Directory to save the featurized texts.",
     )
     parser.add_argument(
@@ -130,18 +107,18 @@ def main() -> None:
     parser.add_argument(
         "--dataset-name",
         type=str,
-        default="en",
+        default=None,
         help="The dataset configuration name (e.g., 'en' for C4).",
     )
     parser.add_argument(
         "--dataset-split",
         type=str,
-        default="train",
+        default=None,
         help="The dataset split (e.g., 'train', 'validation').",
     )
     parser.add_argument(
         "--no-streaming",
-        action="store_true",
+        action="store_false",
         help="Disable streaming mode when loading the dataset.",
     )
     parser.add_argument(
@@ -150,7 +127,12 @@ def main() -> None:
         default=1000000,
         help="The maximum number of mean embeddings to generate.",
     )
-
+    parser.add_argument(
+        "--key",
+        type=str,
+        default="text",
+        help="The maximum number of mean embeddings to generate.",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -160,14 +142,22 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.output_dir is None:
+        model_name = args.model_name.replace("/", "_")
+        dataset_path = args.dataset_path.replace("/", "_")
+        output_dir = f"{model_name}_{dataset_path}_featurized"
+    else:
+        output_dir = args.output_dir
+
     model = SentenceTransformer(args.model_name)
     dataset = load_dataset(
         args.dataset_path,
         name=args.dataset_name,
         split=args.dataset_split,
-        streaming=not args.no_streaming,
+        streaming=args.no_streaming,
     )
-    featurize(dataset, model, args.output_dir, args.max_means, args.batch_size)
+
+    featurize(dataset, model, output_dir, args.max_means, args.batch_size, args.key)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 
+_MAX_N_VAL_SAMPLES = 10_000
+
 
 def train_model(
     model_name: str, train_txt: list[str], train_vec: np.ndarray, device: str = "cpu", vocab_size: int | None = None
@@ -30,12 +32,20 @@ def train_model(
     :param vocab_size: The vocabulary size to use (optional).
     :return: The trained model.
     """
+    pca_for_targets = PCA(n_components=256)
+    train_vec = pca_for_targets.fit_transform(train_vec)
+    logger.info(np.cumsum(pca_for_targets.explained_variance_ratio_)[-1])
+
+    # Split the data into training and validation sets
+    # We use a max of 10k samples as validation data
+    val_samples = min(_MAX_N_VAL_SAMPLES, len(train_txt) // 10)
     train_txt, train_vec, val_txt, val_vec = (
-        train_txt[:-10_000],
-        train_vec[:-10_000],
-        train_txt[-10_000:],
-        train_vec[-10_000:],
+        train_txt[:-val_samples],
+        train_vec[:-val_samples],
+        train_txt[-val_samples:],
+        train_vec[-val_samples:],
     )
+
     if vocab_size:
         # Create a vocabulary if a vocab size is specified
         vocab = create_vocab(texts=train_txt, vocab_size=vocab_size)
@@ -137,9 +147,9 @@ def main() -> None:
     model = train_model(args.model_name, train_txt, train_vec, device=args.device, vocab_size=args.vocab_size)
     save_model(model, args.save_path)
 
-    # Apply weighting and save the weighted model
+    """# Apply weighting and save the weighted model
     weighted_model = weight_model(model, train_txt, pca_dims=256)
-    save_model(weighted_model, args.save_path, is_weighted=True)
+    save_model(weighted_model, args.save_path, is_weighted=True)"""
 
 
 if __name__ == "__main__":
