@@ -34,41 +34,37 @@ def save_data(means: list[np.ndarray], txts: list[str], base_filepath: str) -> N
 
 
 def featurize(
-    texts: Iterable[str], model: SentenceTransformer, output_dir: str, max_means: int, batch_size: int
+    records: list[dict[str, str]], model: SentenceTransformer, output_dir: str, max_means: int, batch_size: int
 ) -> None:
     """
     Featurize text using a sentence transformer.
 
-    :param texts: Iterable of texts to featurize.
+    :param records: Iterable of records to featurize. Each record should have a key with "text".
     :param model: SentenceTransformer model to use.
     :param output_dir: Directory to save the featurized texts.
     :param max_means: Maximum number of mean embeddings to generate.
     :param batch_size: Batch size to use during encoding. Larger batch sizes may improve speed but require more memory.
-    :raises ValueError: If the model does not have a fixed dimension.
     """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    model_dim = model.get_sentence_embedding_dimension()
-    if model_dim is None:
-        raise ValueError("Model does not have a fixed dimension")
 
     txts = []
     means = []
     seen = set()
     total_means = 0
 
-    for index, batch in enumerate(tqdm(batched(texts, batch_size))):
+    for index, batch in enumerate(tqdm(batched(records, batch_size))):
         i = index // _SAVE_INTERVAL
         base_filename = f"featurized_{i}"
-        list_batch = [x["text"].strip() for x in batch if x.get("text")]
-        if not list_batch:
+        texts = [x["text"].strip() for x in batch if x.get("text")]
+        if not texts:
             continue  # Skip empty batches
 
         # Encode the batch to get token embeddings
-        token_embeddings = model.encode(list_batch, output_value="token_embeddings", convert_to_numpy=True)
+        token_embeddings = model.encode(texts, output_value="token_embeddings")
 
         # Tokenize the batch to get input IDs
-        tokenized_ids = model.tokenize(list_batch)["input_ids"]
+        tokenized_ids = model.tokenize(texts)["input_ids"]
 
         for tokenized_id, token_embedding in zip(tokenized_ids, token_embeddings):
             # Decode the token IDs to get the text
