@@ -25,17 +25,19 @@ class StaticModelFineTuner(nn.Module):
         """
         super().__init__()
         self.pad_id = pad_id
+        norms = vectors.norm(dim=1)
+        # Normalize the vectors
+        vectors = vectors / norms[:, None]
         self.embeddings = nn.Embedding.from_pretrained(vectors.clone(), freeze=False, padding_idx=pad_id)
         self.n_out = out_dim
         self.out_layer = nn.Linear(vectors.shape[1], self.n_out)
-        weights = torch.ones(len(vectors))
+        weights = torch.Tensor(norms)
         weights[pad_id] = 0
         self.w = nn.Parameter(weights)
 
     def sub_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass through the mean."""
         w = self.w[input_ids]
-        # w = torch.sigmoid(w)
         zeros = (input_ids != self.pad_id).float()
         w = w * zeros
         # Add a small epsilon to avoid division by zero
@@ -54,7 +56,7 @@ class StaticModelFineTuner(nn.Module):
         return self.out_layer(embedded), embedded
 
     @property
-    def device(self) -> str:
+    def device(self) -> torch.device:
         """Get the device of the model."""
         return self.embeddings.weight.device
 
@@ -225,4 +227,4 @@ def train_supervised(  # noqa: C901
 
     new_model = StaticModel(vectors=vectors, tokenizer=model.tokenizer, config=model.config)
 
-    return new_model, trainable_model
+    return new_model
