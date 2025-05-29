@@ -10,15 +10,22 @@ from model2vec.distill import distill
 from sklearn.decomposition import PCA
 
 from tokenlearn.pretrain import TextDataset, train_supervised
-from tokenlearn.utils import calculate_token_probabilities, collect_means_and_texts, create_vocab
+from tokenlearn.utils import collect_means_and_texts, create_vocab
 
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 
+_MAX_N_VAL_SAMPLES = 10_000
+
 
 def train_model(
-    model_name: str, train_txt: list[str], train_vec: np.ndarray, device: str = "cpu", vocab_size: int | None = None
+    model_name: str,
+    train_txt: list[str],
+    train_vec: np.ndarray,
+    device: str = "cpu",
+    vocab_size: int | None = None,
+    pca_dims: int = 256,
 ) -> StaticModel:
     """
     Train a tokenlearn model.
@@ -28,61 +35,47 @@ def train_model(
     :param train_vec: List of vectors to train on.
     :param device: Device to run the training on.
     :param vocab_size: The vocabulary size to use (optional).
+    :param pca_dims: Number of dimensions to reduce the target embeddings to using PCA.
+        The model will use the same number of dimensions for the embeddings.
     :return: The trained model.
     """
+    pca_for_targets = PCA(n_components=pca_dims)
+    train_vec = pca_for_targets.fit_transform(train_vec)
+    var = np.cumsum(pca_for_targets.explained_variance_ratio_)[-1]
+    logger.info(f"Explained variance of target embeddings: {var:.2f}")
+
+    # Split the data into training and validation sets
+    # We use a max of 10k samples as validation data
+    val_samples = min(_MAX_N_VAL_SAMPLES, len(train_txt) // 10)
+    train_txt, train_vec, val_txt, val_vec = (
+        train_txt[:-val_samples],
+        train_vec[:-val_samples],
+        train_txt[-val_samples:],
+        train_vec[-val_samples:],
+    )
+
     if vocab_size:
         # Create a vocabulary if a vocab size is specified
         vocab = create_vocab(texts=train_txt, vocab_size=vocab_size)
-        model = distill(model_name=model_name, vocabulary=vocab)
-        logger.info(f"Vocabulary size: {len(vocab)}")
+        logger.info(f"Vocabulary created with {len(vocab)} tokens.")
     else:
-        model = distill(model_name=model_name)
+        vocab = None
+    model = distill(model_name=model_name, quantize_to="float32", vocabulary=vocab, pca_dims=pca_dims)
     train_data = TextDataset(train_txt, torch.from_numpy(train_vec), model.tokenizer)
+    val_data = TextDataset(val_txt, torch.from_numpy(val_vec), model.tokenizer)
 
     # Train the model
-    model, _ = train_supervised(train_dataset=train_data, model=model, device=device)
+    model = train_supervised(train_dataset=train_data, validation_dataset=val_data, model=model, device=device)
     return model
 
 
-def weight_model(model: StaticModel, text: List[str], pca_dims: int, alpha: float = 1e-3) -> StaticModel:
-    """
-    Function to weight the model.
-
-    :param model: The model to weight.
-    :param text: The text to use for weighting.
-    :param pca_dims: The number of PCA dimensions to use.
-    :param alpha: The alpha value for SIF weighting. Words with probabilities above this value will be downweighted.
-    :return: The weighted model.
-    """
-    logging.info("Applying reweighting and PCA to the model.")
-    probas = calculate_token_probabilities(model.tokenizer, text)
-
-    w = model.embedding
-    w = np.nan_to_num(w)
-
-    # Apply PCA
-    p = PCA(n_components=pca_dims)
-    w = p.fit_transform(w)
-
-    # Apply SIF weighting
-    f = alpha / (alpha + probas)
-    w *= f[:, None]
-    model.embedding = w
-    model.normalize = True
-
-    return model
-
-
-def save_model(model: StaticModel, save_path: str, is_weighted: bool = False) -> None:
+def save_model(model: StaticModel, save_path: str) -> None:
     """
     Save the model to the specified path.
 
     :param model: The model to save.
     :param save_path: Path to save the model.
-    :param is_weighted: Whether the model is weighted.
     """
-    if is_weighted:
-        save_path = f"{save_path}_weighted"
     model.save_pretrained(save_path)
     logging.info(f"Model saved to {save_path}")
 
@@ -117,8 +110,14 @@ def main() -> None:
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=None,
+        default=56000,
         help="The vocabulary size to use for training.",
+    )
+    parser.add_argument(
+        "--pca-dims",
+        type=int,
+        default=256,
+        help="Number of dimensions to reduce the target embeddings to using PCA.",
     )
     args = parser.parse_args()
 
@@ -127,12 +126,10 @@ def main() -> None:
     train_txt, train_vec = collect_means_and_texts(paths)
 
     # Train the model
-    model = train_model(args.model_name, train_txt, train_vec, device=args.device, vocab_size=args.vocab_size)
+    model = train_model(
+        args.model_name, train_txt, train_vec, device=args.device, vocab_size=args.vocab_size, pca_dims=args.pca_dims
+    )
     save_model(model, args.save_path)
-
-    # Apply weighting and save the weighted model
-    weighted_model = weight_model(model, train_txt, pca_dims=256)
-    save_model(weighted_model, args.save_path, is_weighted=True)
 
 
 if __name__ == "__main__":

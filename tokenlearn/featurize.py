@@ -2,96 +2,80 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Iterator
 
 import numpy as np
 from datasets import load_dataset
 from more_itertools import batched
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+from transformers.tokenization_utils import PreTrainedTokenizer
 
-_SAVE_INTERVAL = 10
+_SAVE_EVERY = 32
+
+
 logger = logging.getLogger(__name__)
 
 
-def save_data(means: list[np.ndarray], txts: list[str], base_filepath: str) -> None:
-    """
-    Save the means and texts to separate files.
-
-    :param means: List of numpy arrays representing the mean embeddings.
-    :param txts: List of texts corresponding to the embeddings.
-    :param base_filepath: Base path for the output files.
-    """
-    vectors_filepath = base_filepath + "_vectors.npy"
-    items_filepath = base_filepath + "_items.json"
-
-    # Save the embeddings (vectors) to a .npy file
-    np.save(vectors_filepath, np.array(means))
-    # Save the texts to a JSON file
-    with open(items_filepath, "w") as f:
-        json.dump({"items": txts}, f)
-    logger.info(f"Saved {len(txts)} texts to {items_filepath} and vectors to {vectors_filepath}")
-
-
 def featurize(
-    records: list[dict[str, str]], model: SentenceTransformer, output_dir: str, max_means: int, batch_size: int
+    dataset: Iterator[dict[str, str]],
+    model: SentenceTransformer,
+    output_dir: str,
+    max_means: int,
+    batch_size: int,
+    text_key: str,
 ) -> None:
-    """
-    Featurize text using a sentence transformer.
+    """Make a directory and dump all kinds of data in it."""
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    :param records: Iterable of records to featurize. Each record should have a key with "text".
-    :param model: SentenceTransformer model to use.
-    :param output_dir: Directory to save the featurized texts.
-    :param max_means: Maximum number of mean embeddings to generate.
-    :param batch_size: Batch size to use during encoding. Larger batch sizes may improve speed but require more memory.
-    """
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    # Ugly hack
+    largest_batch = max([int(x.stem.split("_")[1]) for x in list(output_dir_path.glob("*.json"))], default=0)
+    if largest_batch:
+        logger.info(f"Resuming from batch {largest_batch}, skipping previous batches.")
 
-    txts = []
-    means = []
-    seen = set()
-    total_means = 0
+    texts = []
+    embeddings = []
+    dim = model.get_sentence_embedding_dimension()
+    if dim is None:
+        raise ValueError("Model has no sentence embedding dimension.")
 
-    for index, batch in enumerate(tqdm(batched(records, batch_size))):
-        i = index // _SAVE_INTERVAL
-        base_filename = f"featurized_{i}"
-        texts = [x["text"].strip() for x in batch if x.get("text")]
-        if not texts:
-            continue  # Skip empty batches
+    tokenizer: PreTrainedTokenizer = model.tokenizer
+    # Binding i in case the dataset is empty.
+    i = 0
+    for i, batch in tqdm(enumerate(batched(dataset, n=batch_size))):
+        if i * batch_size >= max_means:
+            logger.info(f"Reached maximum number of means: {max_means}")
+            break
+        if largest_batch and i <= largest_batch:
+            continue
+        batch = [x[text_key] for x in batch]
 
-        # Encode the batch to get token embeddings
-        token_embeddings = model.encode(texts, output_value="token_embeddings")
+        if not all(isinstance(x, str) for x in batch):
+            raise ValueError(f"Detected non-string at batch: {i}")
 
-        # Tokenize the batch to get input IDs
-        tokenized_ids = model.tokenize(texts)["input_ids"]
+        batch_embeddings = model.encode(batch, output_value="token_embeddings")  # type: ignore  # Annoying
+        for text, embedding in zip(batch, batch_embeddings):
+            texts.append(_truncate_text(tokenizer, text))
+            embeddings.append(embedding[1:-1].mean(axis=0).cpu().numpy())
+        if i and i % _SAVE_EVERY == 0:
+            json.dump(texts, open(output_dir_path / f"feature_{i}.json", "w"), indent=4)
+            np.save(output_dir_path / f"feature_{i}.npy", embeddings)
+            texts = []
+            embeddings = []
+    if texts:
+        json.dump(texts, open(output_dir_path / f"feature_{i}.json", "w"), indent=4)
+        np.save(output_dir_path / f"feature_{i}.npy", embeddings)
 
-        for tokenized_id, token_embedding in zip(tokenized_ids, token_embeddings):
-            # Decode the token IDs to get the text
-            text = model.tokenizer.decode(tokenized_id, skip_special_tokens=True)
-            if text in seen:
-                continue
-            seen.add(text)
-            # Get the corresponding token embeddings (excluding special tokens)
-            token_embeds = token_embedding[1:-1].detach().cpu().numpy()
-            # Compute the mean of the token embeddings
-            mean = np.mean(token_embeds, axis=0)
-            txts.append(text)
-            means.append(mean)
-            total_means += 1
 
-            if total_means >= max_means:
-                save_data(means, txts, str(out_path / base_filename))
-                return
-
-        if index > 0 and (index + 1) % _SAVE_INTERVAL == 0:
-            save_data(means, txts, str(out_path / base_filename))
-            txts = []
-            means = []
-            seen = set()
-    else:
-        if txts and means:
-            save_data(means, txts, str(out_path / base_filename))
+def _truncate_text(tokenizer: PreTrainedTokenizer, text: str) -> str:
+    """Truncate text to fit the tokenizer's maximum length."""
+    tokens = tokenizer.encode(
+        text,
+        truncation=True,
+        max_length=tokenizer.model_max_length,
+    )
+    return tokenizer.decode(tokens, skip_special_tokens=True)
 
 
 def main() -> None:
@@ -106,7 +90,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="data/c4_bgebase",
+        default=None,
         help="Directory to save the featurized texts.",
     )
     parser.add_argument(
@@ -129,7 +113,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-streaming",
-        action="store_true",
+        action="store_false",
         help="Disable streaming mode when loading the dataset.",
     )
     parser.add_argument(
@@ -138,7 +122,12 @@ def main() -> None:
         default=1000000,
         help="The maximum number of mean embeddings to generate.",
     )
-
+    parser.add_argument(
+        "--key",
+        type=str,
+        default="text",
+        help="The key of the text field in the dataset to featurize (default: 'text').",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -148,14 +137,22 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.output_dir is None:
+        model_name = args.model_name.replace("/", "_")
+        dataset_path = args.dataset_path.replace("/", "_")
+        output_dir = f"{model_name}_{dataset_path}_featurized"
+    else:
+        output_dir = args.output_dir
+
     model = SentenceTransformer(args.model_name)
     dataset = load_dataset(
         args.dataset_path,
         name=args.dataset_name,
         split=args.dataset_split,
-        streaming=not args.no_streaming,
+        streaming=args.no_streaming,
     )
-    featurize(dataset, model, args.output_dir, args.max_means, args.batch_size)
+
+    featurize(iter(dataset), model, output_dir, args.max_means, args.batch_size, args.key)
 
 
 if __name__ == "__main__":
