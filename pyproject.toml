@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "model2vec[distill]>=0.3.0",
+    "model2vec[distill]>=0.5.0",
     "sentence-transformers",
     "torch",
     "datasets",

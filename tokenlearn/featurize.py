@@ -31,6 +31,8 @@ def featurize(
 
     # Ugly hack
     largest_batch = max([int(x.stem.split("_")[1]) for x in list(output_dir_path.glob("*.json"))], default=0)
+    if largest_batch:
+        logger.info(f"Resuming from batch {largest_batch}, skipping previous batches.")
 
     texts = []
     embeddings = []
@@ -124,7 +126,7 @@ def main() -> None:
         "--key",
         type=str,
         default="text",
-        help="The maximum number of mean embeddings to generate.",
+        help="The key of the text field in the dataset to featurize (default: 'text').",
     )
     parser.add_argument(
         "--batch-size",

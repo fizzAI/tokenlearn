@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import torch
 from model2vec import StaticModel
+from model2vec.distill.utils import select_optimal_device
 from tokenizers import Tokenizer
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
@@ -108,7 +109,7 @@ def train_supervised(  # noqa: C901
     validation_dataset: TextDataset,
     model: StaticModel,
     patience: int | None = 5,
-    device: str = "mps",
+    device: str | None = None,
     batch_size: int = 256,
     lr: float = 1e-3,
 ) -> StaticModel:
@@ -124,6 +125,7 @@ def train_supervised(  # noqa: C901
     :param lr: The learning rate.
     :return: The trained model.
     """
+    device = select_optimal_device(device)
     train_dataloader = train_dataset.to_dataloader(shuffle=True, batch_size=batch_size)
 
     # Initialize the model
@@ -175,7 +177,8 @@ def train_supervised(  # noqa: C901
 
                 barred_train.set_description_str(f"Train Loss: {np.mean(train_losses[-10:]):.3f}")
 
-                if idx > 0 and idx % 1000 == 0:
+                # Evaluate every 1000 steps and at the end of the epoch
+                if (idx > 0 and idx % 1000 == 0) or idx == len(train_dataloader) - 1:
                     trainable_model.eval()
                     with torch.no_grad():
                         validation_losses = []
