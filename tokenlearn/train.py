@@ -25,6 +25,7 @@ def train_model(
     train_vec: np.ndarray,
     device: str = "cpu",
     pca_dims: int = 256,
+    checkpoint_path: str | None = None,
 ) -> StaticModel:
     """
     Train a tokenlearn model.
@@ -34,6 +35,7 @@ def train_model(
     :param train_vec: List of vectors to train on.
     :param device: Device to run the training on.
     :param pca_dims: Number of dimensions to reduce the target embeddings to using PCA.
+    :param checkpoint_path: Path to save checkpoints when validation loss improves (optional).
     :return: The trained model.
     """
     pca_for_targets = PCA(n_components=pca_dims)
@@ -55,7 +57,7 @@ def train_model(
     val_data = TextDataset(val_txt, torch.from_numpy(val_vec), model.tokenizer)
 
     # Train the model
-    model = train_supervised(train_dataset=train_data, validation_dataset=val_data, model=model, device=device)
+    model = train_supervised(train_dataset=train_data, validation_dataset=val_data, model=model, device=device, checkpoint_path=checkpoint_path)
     return model
 
 
@@ -103,6 +105,11 @@ def main() -> None:
         default=256,
         help="Number of dimensions to reduce the target embeddings to using PCA.",
     )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        help="Path to save checkpoints when validation loss improves (optional).",
+    )
     args = parser.parse_args()
 
     # Collect paths for training data
@@ -123,7 +130,7 @@ def main() -> None:
     )
 
     # Train the model
-    model = train_model(model, train_txt, train_vec, device=args.device, pca_dims=pca_dims)
+    model = train_model(model, train_txt, train_vec, device=args.device, pca_dims=pca_dims, checkpoint_path=args.checkpoint_path)
     model.save_pretrained(args.save_path)
 
 

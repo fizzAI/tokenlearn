@@ -116,6 +116,7 @@ def train_supervised(  # noqa: C901
     device: str | None = None,
     batch_size: int = 256,
     lr: float = 1e-3,
+    checkpoint_path: str | None = None,
 ) -> StaticModel:
     """
     Train a tokenlearn model.
@@ -127,6 +128,7 @@ def train_supervised(  # noqa: C901
     :param device: The device to train on.
     :param batch_size: The batch size.
     :param lr: The learning rate.
+    :param checkpoint_path: The path to save checkpoints when validation loss improves.
     :return: The trained model.
     """
     device = select_optimal_device(device)
@@ -200,10 +202,44 @@ def train_supervised(  # noqa: C901
                         validation_loss = np.mean(validation_losses)
                     # Early stopping logic based on validation loss
                     if patience is not None and curr_patience is not None:
-                        if (lowest_loss - validation_loss) > 1e-4:
+                        if (lowest_loss - validation_loss) > 1e-6:
                             param_dict = trainable_model.state_dict()  # Save best model state based on training loss
                             curr_patience = patience
                             lowest_loss = validation_loss
+                            
+                            # Save checkpoint when validation loss improves
+                            if checkpoint_path is not None:
+                                logger.info(f"New best validation loss: {validation_loss:.5f}. Saving checkpoint to {checkpoint_path}")
+                                
+                                # Create a temporary model with current best weights for checkpointing
+                                temp_model = StaticModelFineTuner(
+                                    torch.from_numpy(model.embedding),
+                                    out_dim=train_dataset.targets.shape[1],
+                                    pad_id=1,
+                                )
+                                temp_model.load_state_dict(param_dict)
+                                temp_model.to(device)
+                                temp_model.eval()
+                                
+                                # Get the updated embeddings
+                                embeddings_weight = temp_model.embeddings.weight.to(device)
+                                with torch.no_grad():
+                                    checkpoint_vectors = temp_model.sub_forward(
+                                        torch.arange(len(embeddings_weight))[:, None].to(device)
+                                    ).cpu().numpy()
+                                
+                                # Create and save the checkpoint model
+                                checkpoint_model = StaticModel(
+                                    vectors=checkpoint_vectors, 
+                                    tokenizer=model.tokenizer, 
+                                    config=model.config
+                                )
+                                checkpoint_model.save_pretrained(checkpoint_path)
+                                
+                                # Clean up temporary model
+                                del temp_model
+                                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                                
                         else:
                             curr_patience -= 1
                             if curr_patience == 0:
