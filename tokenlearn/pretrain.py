@@ -14,7 +14,7 @@ from tqdm import tqdm
 import heavyball
 import heavyball.utils
 
-heavyball.utils.compile_mode = None
+#heavyball.utils.compile_mode = None
 
 logger = logging.getLogger(__name__)
 
