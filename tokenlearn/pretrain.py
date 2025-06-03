@@ -148,8 +148,8 @@ def train_supervised(  # noqa: C901
     )
 
     # Create optimizer with separate parameter groups
-    optimizer = torch.optim.AdamW(params=model_params, lr=lr)
-    #optimizer = heavyball.ForeachSOAP(params=model_params, lr=lr, warmup_steps=100)
+    #optimizer = torch.optim.AdamW(params=model_params, lr=lr)
+    optimizer = heavyball.ForeachAdamW(params=model_params, lr=lr)
 
     lowest_loss = float("inf")
     param_dict = trainable_model.state_dict()
