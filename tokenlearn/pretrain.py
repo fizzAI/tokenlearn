@@ -11,6 +11,10 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+import heavyball
+import heavyball.utils
+
+heavyball.utils.compile_mode = None
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +136,7 @@ def train_supervised(  # noqa: C901
     trainable_model = StaticModelFineTuner(
         torch.from_numpy(model.embedding),
         out_dim=train_dataset.targets.shape[1],
-        pad_id=model.tokenizer.token_to_id("[PAD]"),
+        pad_id=1,
     )
     trainable_model.to(device)
 
@@ -145,6 +149,7 @@ def train_supervised(  # noqa: C901
 
     # Create optimizer with separate parameter groups
     optimizer = torch.optim.AdamW(params=model_params, lr=lr)
+    #optimizer = heavyball.ForeachSOAP(params=model_params, lr=lr, warmup_steps=100)
 
     lowest_loss = float("inf")
     param_dict = trainable_model.state_dict()
@@ -175,7 +180,7 @@ def train_supervised(  # noqa: C901
                 optimizer.step()
                 train_losses.append(train_loss.item())
 
-                barred_train.set_description_str(f"Train Loss: {np.mean(train_losses[-10:]):.3f}")
+                barred_train.set_description_str(f"Train Loss: {np.mean(train_losses[-10:]):.5f}")
 
                 # Evaluate every 1000 steps and at the end of the epoch
                 if (idx > 0 and idx % 1000 == 0) or idx == len(train_dataloader) - 1:
@@ -190,7 +195,7 @@ def train_supervised(  # noqa: C901
                             y_hat_val, _ = trainable_model(x_val)
                             val_loss = criterion(y_hat_val, y_val.to(trainable_model.device)).mean()
                             validation_losses.append(val_loss.item())
-                            barred_val.set_description_str(f"Validation Loss: {np.mean(validation_losses):.3f}")
+                            barred_val.set_description_str(f"Validation Loss: {np.mean(validation_losses):.5f}")
 
                         validation_loss = np.mean(validation_losses)
                     # Early stopping logic based on validation loss
@@ -205,8 +210,8 @@ def train_supervised(  # noqa: C901
                                 stop = True
                                 break
                         logger.info(f"Patience level: {patience - curr_patience}")
-                        logger.info(f"Validation loss: {validation_loss:.3f}")
-                        logger.info(f"Lowest loss: {lowest_loss:.3f}")
+                        logger.info(f"Validation loss: {validation_loss:.5f}")
+                        logger.info(f"Lowest loss: {lowest_loss:.5f}")
 
                     trainable_model.train()
 
